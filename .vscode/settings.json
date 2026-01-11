@@ -1,0 +1,17 @@
+{
+  "C_Cpp.intelliSenseEngine": "default",
+  "clangd.path": "/Users/censivn/workspace/ai/hardware/esp_path/tools/esp-clang/esp-19.1.2_20250312/esp-clang/bin/clangd",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=/Users/censivn/workspace/ai/hardware/arduino/TEST/build"
+  ],
+  "idf.port": "/dev/tty.usbmodem202201",
+  "idf.openOcdConfigs": [
+    "board/esp32h2-builtin.cfg"
+  ],
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32h2"
+  },
+  "idf.flashType": "UART"
+}
