@@ -1,136 +1,68 @@
-# ESP32-H2 Zigbee Servo Switch
+# Arduino-ESP32 Zigbee Color Dimmable Light Example
 
-基于 ESP32-H2 的 Zigbee 智能舵机开关，通过舵机模拟物理按键按压动作。
+This example shows how to configure the Zigbee end device and use it as a Home Automation (HA) color dimmable light.
 
-## 功能特性
+# Supported Targets
 
-- Zigbee 3.0 Router 设备
-- 舵机控制，模拟按键按下/释放
-- 2秒自动回弹
-- 本地按键控制
-- RGB LED 状态指示
-- 长按3秒工厂重置
+Currently, this example supports the following targets.
 
-## 硬件连接
+| Supported Targets | ESP32-C6 | ESP32-H2 |
+| ----------------- | -------- | -------- |
 
-| 组件 | GPIO | 说明 |
-|------|------|------|
-| 舵机 PWM | 5 | 信号线(黄/橙) |
-| 按键 | 9 | 内部上拉，按下接地 |
-| RGB LED | 8 | WS2812 |
+## Hardware Required
 
-```
-ESP32-H2        舵机           按键
-   5 ---------> PWM
-   9 -----------------------> 一端
-  GND --------> GND --------> 另一端
-  3.3V -------> VCC
-   8 ---------> WS2812 LED
-```
+* One development board (ESP32-H2 or ESP32-C6) acting as Zigbee coordinator (loaded with Zigbee_Color_Dimmer_Switch example)
+* A USB cable for power supply and programming
+* Choose another board (ESP32-H2 or ESP32-C6) as Zigbee end device and upload the Zigbee_Color_Dimmable_Light example
 
-## 舵机控制逻辑
+### Configure the Project
 
-```
-按键/Zigbee ON
-     │
-     ▼
-┌─────────────┐     2秒后自动     ┌─────────────┐
-│ TARGET 160° │ ───────────────> │  REST 20°   │
-└─────────────┘                   └─────────────┘
-     ▲                                   │
-     │      按键/Zigbee OFF 立即返回      │
-     └───────────────────────────────────┘
-```
+Set the LED GPIO by changing the `LED_PIN` definition. By default, the LED_PIN is `RGB_BUILTIN`.
 
-### 动作说明
+#### Using Arduino IDE
 
-| 触发条件 | 动作 |
-|----------|------|
-| 按键(舵机在REST) | 移动到160°，启动2秒定时器 |
-| 按键(舵机在TARGET) | 立即返回20°，取消定时器 |
-| 2秒定时器触发 | 自动返回20° |
-| Zigbee ON命令 | 移动到160°，启动2秒定时器 |
-| Zigbee OFF命令 | 立即返回20° |
+To get more information about the Espressif boards see [Espressif Development Kits](https://www.espressif.com/en/products/devkits).
 
-## 按键操作
+* Before Compile/Verify, select the correct board: `Tools -> Board`.
+* Select the End device Zigbee mode: `Tools -> Zigbee mode: Zigbee ED (end device)`
+* Select Partition Scheme for Zigbee: `Tools -> Partition Scheme: Zigbee 4MB with spiffs`
+* Select the COM port: `Tools -> Port: xxx` where the `xxx` is the detected COM port.
+* Optional: Set debug level to verbose to see all logs from Zigbee stack: `Tools -> Core Debug Level: Verbose`.
 
-| 操作 | 功能 |
-|------|------|
-| 短按 | 舵机动作切换 |
-| 长按3秒 | 工厂重置(清除配网信息) |
+## Troubleshooting
 
-## LED 状态指示
+If the End device flashed with this example is not connecting to the coordinator, erase the flash of the End device before flashing the example to the board. It is recommended to do this if you re-flash the coordinator.
+You can do the following:
 
-| 状态 | LED显示 |
-|------|---------|
-| 配对中 | 蓝色闪烁 |
-| 已连接 | 绿色常亮 |
-| 错误 | 红色闪烁 |
-| 重置警告 | 蓝色常亮 |
+* In the Arduino IDE go to the Tools menu and set `Erase All Flash Before Sketch Upload` to `Enabled`.
+* Add to the sketch `Zigbee.factoryReset();` to reset the device and Zigbee stack.
 
-## Zigbee 配置
+By default, the coordinator network is closed after rebooting or flashing new firmware.
+To open the network you have 2 options:
 
-| 参数 | 值 |
-|------|-----|
-| 设备类型 | Router |
-| 端点 | 10 |
-| 设备ID | On/Off Light |
-| 制造商 | ESPRESSIF |
-| 型号 | ESP32H2_ZB_SWITCH |
+* Open network after reboot by setting `Zigbee.setRebootOpenNetwork(time);` before calling `Zigbee.begin();`.
+* In application you can anytime call `Zigbee.openNetwork(time);` to open the network for devices to join.
 
-## 编译烧录
+***Important: Make sure you are using a good quality USB cable and that you have a reliable power source***
 
-```bash
-# 设置环境
-source $IDF_PATH/export.sh
-idf.py set-target esp32h2
+* **LED not blinking:** Check the wiring connection and the IO selection.
+* **Programming Fail:** If the programming/flash procedure fails, try reducing the serial connection speed.
+* **COM port not detected:** Check the USB cable and the USB to Serial driver installation.
 
-# 编译
-idf.py build
+If the error persists, you can ask for help at the official [ESP32 forum](https://esp32.com) or see [Contribute](#contribute).
 
-# 烧录
-idf.py -p /dev/ttyUSB0 flash
+## Contribute
 
-# 监控日志
-idf.py -p /dev/ttyUSB0 monitor
-```
+To know how to contribute to this project, see [How to contribute.](https://github.com/espressif/arduino-esp32/blob/master/CONTRIBUTING.rst)
 
-## 配对流程
+If you have any **feedback** or **issue** to report on this example/library, please open an issue or fix it by creating a new PR. Contributions are more than welcome!
 
-1. 上电后设备自动进入配对模式(蓝色LED闪烁)
-2. 在Zigbee网关/协调器上搜索新设备
-3. 配对成功后LED变为绿色常亮
-4. 如需重新配对，长按按键3秒进行工厂重置
+Before creating a new issue, be sure to try Troubleshooting and check if the same issue was already created by someone else.
 
-## 参数配置
+## Resources
 
-在 `main/main.c` 中修改:
-
-```c
-#define SERVO_TARGET_ANGLE      160     // 目标角度
-#define SERVO_REST_ANGLE        20      // 休息角度
-#define SERVO_AUTO_RETURN_MS    2000    // 自动返回延迟(ms)
-#define BUTTON_LONG_PRESS_MS    3000    // 长按触发时间(ms)
-```
-
-## 项目结构
-
-```
-├── main/
-│   └── main.c              # 主程序
-├── CMakeLists.txt          # 构建配置
-├── partitions.csv          # 分区表
-├── sdkconfig.defaults      # SDK默认配置
-└── README.md               # 本文档
-```
-
-## 依赖
-
-- ESP-IDF >= 5.0
-- esp-zigbee-lib ~1.6.0
-- esp-zboss-lib ~1.6.0
-- led_strip ^2.0.0
-
-## License
-
-MIT
+* Official ESP32 Forum: [Link](https://esp32.com)
+* Arduino-ESP32 Official Repository: [espressif/arduino-esp32](https://github.com/espressif/arduino-esp32)
+* ESP32-C6 Datasheet: [Link to datasheet](https://www.espressif.com/sites/default/files/documentation/esp32-c6_datasheet_en.pdf)
+* ESP32-H2 Datasheet: [Link to datasheet](https://www.espressif.com/sites/default/files/documentation/esp32-h2_datasheet_en.pdf)
+* Official ESP-IDF documentation: [ESP-IDF](https://idf.espressif.com)
