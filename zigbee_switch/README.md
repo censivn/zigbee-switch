@@ -1,21 +1,39 @@
-# ESP32-H2 Zigbee Color Dimmable Light
+# ESP32-H2 Zigbee Smart Switch with Servo Control
 
-基于 ESP32-H2 的 Zigbee 彩色可调光灯，支持本地按键控制和状态同步到 Zigbee2MQTT。
+基于 ESP32-H2 的 Zigbee 智能开关，通过舵机物理控制传统开关，支持本地按键控制和状态同步到 Zigbee2MQTT。
+
+## 项目简介
+
+本项目将 ESP32-H2 模拟为 Zigbee 彩色可调光灯设备，但实际用途是通过舵机物理按压/释放传统墙壁开关，实现智能化改造而无需更换开关或电路。
 
 ## 功能特性
 
+- **舵机控制**: 开灯时舵机转动到目标角度按压开关，2秒后自动回位
 - **本地控制**: 短按按钮 Toggle 灯光开关，状态自动同步到网关
 - **恢复出厂**: 长按按钮 3 秒恢复出厂设置并重新配网
 - **配网指示**: LED 蓝色慢闪表示配网中
 - **超时保护**: 配网超时 40 秒后进入深度睡眠，节省电量
 - **唤醒机制**: 深度睡眠后长按 3 秒唤醒并重新配网
-- **颜色支持**: 支持 RGB (X/Y) 和色温两种颜色模式
+- **颜色支持**: 支持 RGB (X/Y) 和色温两种颜色模式 (用于 LED 状态指示)
 
 ## 硬件要求
 
 - ESP32-H2 开发板
 - 内置 RGB LED (使用 `RGB_BUILTIN`)
 - Boot 按钮 (使用 `BOOT_PIN`)
+- SG90 或类似舵机 (连接到 GPIO 5)
+
+### 硬件接线
+
+| ESP32-H2 引脚 | 连接设备 | 说明 |
+|--------------|---------|------|
+| GPIO 5 | 舵机信号线 (橙/黄) | PWM 控制信号 |
+| 3.3V/5V | 舵机电源线 (红) | 舵机供电 |
+| GND | 舵机地线 (棕/黑) | 共地 |
+| RGB_BUILTIN | 内置 LED | 状态指示 |
+| BOOT_PIN | 内置按钮 | 用户控制 |
+
+> **注意**: 舵机最好使用独立 5V 电源供电，避免电流不足导致 ESP32 重启。
 
 ## 编译配置
 
@@ -46,6 +64,37 @@ arduino-cli compile --fqbn esp32:esp32:esp32h2:ZigbeeMode=ed,PartitionScheme=zig
 | 正常运行 | 由 Zigbee 网关控制 |
 | 恢复出厂 | 红灯闪烁 |
 
+## 舵机工作原理
+
+### 动作流程
+
+```
+开灯指令 → 舵机转到 160° (按压开关) → 2秒后自动回位到 20° (释放开关)
+关灯指令 → 舵机立即回位到 20° (释放开关)
+```
+
+### 舵机参数
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| `SERVO_PIN` | GPIO 5 | 舵机控制引脚 |
+| `SERVO_TARGET_ANGLE` | 160° | 按压开关的角度 |
+| `SERVO_REST_ANGLE` | 20° | 静止/释放的角度 |
+| `SERVO_AUTO_RETURN_MS` | 2000ms | 自动回位延时 |
+| `LEDC_FREQUENCY` | 50Hz | PWM 频率 (舵机标准) |
+
+### PWM 占空比计算
+
+舵机使用 LEDC (LED Control) 外设产生 50Hz PWM 信号：
+
+```cpp
+// 13-bit 分辨率，50Hz
+// 0°   → duty = 205  (约 0.5ms 脉宽)
+// 180° → duty = 1024 (约 2.5ms 脉宽)
+
+int duty = SERVO_DUTY_MIN + (angle * (SERVO_DUTY_MAX - SERVO_DUTY_MIN) / 180);
+```
+
 ## 代码架构
 
 ### 文件结构
@@ -62,6 +111,7 @@ zigbee_switch/
 |------|------|
 | Configuration | 配置参数定义 |
 | State Management | 状态枚举和结构体 |
+| Servo Control | 舵机初始化、角度控制、自动回位 |
 | LED Control | LED 颜色和闪烁控制 |
 | Light Control | Zigbee 灯光回调处理 |
 | Zigbee Report | 状态上报功能 |
@@ -70,6 +120,13 @@ zigbee_switch/
 | Deep Sleep | 深度睡眠和唤醒处理 |
 
 ### 主要函数
+
+#### 舵机控制
+- `servoInit()` - 初始化 LEDC 和定时器
+- `servoSetAngle(angle)` - 设置舵机角度 (0-180°)
+- `servoPlay()` - 舵机按压动作，启动自动回位定时器
+- `servoRest()` - 舵机回到休息位置
+- `servoReturnCallback(arg)` - 定时器回调，设置自动回位标志
 
 #### LED 控制
 - `ledSetColor(r, g, b)` - 设置 LED 颜色
@@ -88,6 +145,8 @@ zigbee_switch/
 - `reportLightState()` - 报告所有状态
 
 #### 灯光控制
+- `turnLightOn()` - 开灯并触发舵机
+- `turnLightOff()` - 关灯并舵机回位
 - `toggleLight()` - Toggle 灯光并上报状态
 
 #### 按钮处理
@@ -195,16 +254,24 @@ Zigbee.factoryReset();
 ## 配置参数
 
 ```cpp
-// 硬件
+// 硬件引脚
 #define ZIGBEE_RGB_LIGHT_ENDPOINT 10
 const uint8_t LED_PIN = RGB_BUILTIN;
 const uint8_t BUTTON_PIN = BOOT_PIN;
+const uint8_t SERVO_PIN = 5;
 
-// 时间
+// 时间配置
 const unsigned long PAIRING_TIMEOUT_MS = 40000;  // 配网超时 40秒
 const unsigned long LED_SLOW_BLINK_MS = 500;     // 慢闪间隔
 const unsigned long LONG_PRESS_MS = 3000;        // 长按时间 3秒
 const unsigned long DEBOUNCE_MS = 100;           // 消抖时间
+
+// 舵机配置
+const int SERVO_DUTY_MIN = 205;                  // 0度对应的 duty
+const int SERVO_DUTY_MAX = 1024;                 // 180度对应的 duty
+const int SERVO_TARGET_ANGLE = 160;              // 目标角度 (按压)
+const int SERVO_REST_ANGLE = 20;                 // 休息角度 (释放)
+const unsigned long SERVO_AUTO_RETURN_MS = 2000; // 自动回位时间
 
 // 默认灯光
 const uint8_t DEFAULT_BRIGHTNESS = 255;
@@ -232,6 +299,36 @@ if (reason == ESP_SLEEP_WAKEUP_GPIO) {
 
 **注意**: ESP32-H2 不支持 `ext0/ext1` 唤醒，需使用 `gpio_wakeup_enable()`。
 
+## 主循环流程
+
+```cpp
+void loop() {
+  // 1. 处理舵机自动回位 (从定时器回调触发)
+  if (servoAutoReturnPending) {
+    servoAutoReturnPending = false;
+    turnLightOff();  // 在主循环上下文调用，可安全使用 Zigbee API
+  }
+
+  // 2. 处理按钮
+  ButtonAction action = checkButton();
+  if (action != BUTTON_NONE) {
+    handleButton(action);
+  }
+
+  // 3. 处理配网状态
+  updatePairingState();
+
+  delay(10);
+}
+```
+
+### 定时器回调注意事项
+
+舵机自动回位使用 `esp_timer`，回调函数运行在定时器任务上下文中，**不能直接调用 Zigbee API**。因此采用标志位机制：
+
+1. 定时器回调设置 `servoAutoReturnPending = true`
+2. 主循环检测标志位，在安全上下文中调用 `turnLightOff()`
+
 ## 常见问题
 
 ### Q: 状态上报不成功？
@@ -242,6 +339,15 @@ A: 可以。End Device 可以主动发送消息，只需正确配置目标地址
 
 ### Q: 配网超时怎么办？
 A: 设备会进入深度睡眠。长按按钮 3 秒唤醒并重新配网。
+
+### Q: 舵机角度需要调整？
+A: 修改 `SERVO_TARGET_ANGLE` (按压角度) 和 `SERVO_REST_ANGLE` (静止角度) 常量，根据实际安装位置调整。
+
+### Q: 舵机抖动或不工作？
+A: 检查电源供电是否充足。SG90 舵机堵转电流可达 500mA+，建议使用独立 5V 电源。
+
+### Q: 自动回位时间太长/太短？
+A: 修改 `SERVO_AUTO_RETURN_MS` 常量 (毫秒)。
 
 ## 许可证
 
