@@ -13,18 +13,13 @@
 // limitations under the License.
 
 /**
- * @brief This example demonstrates Zigbee Color Dimmable light bulb with RGB and Temperature support.
+ * @brief Zigbee Color Dimmable Light with pairing status indication
  *
- * The example demonstrates how to use Zigbee library to create an end device with
- * color dimmable light end point supporting both RGB (X/Y) and Color Temperature modes.
- * The light bulb is a Zigbee end device, which is controlled by a Zigbee coordinator.
- *
- * Proper Zigbee mode must be selected in Tools->Zigbee mode
- * and also the correct partition scheme must be selected in Tools->Partition Scheme.
- *
- * Please check the README.md for instructions and more detailed description.
- *
- * Created by Jan Procházka (https://github.com/P-R-O-C-H-Y/)
+ * Features:
+ * - Short press: Toggle light on/off
+ * - Long press (3s): Factory reset and re-pair
+ * - Pairing timeout with deep sleep
+ * - LED status indication during pairing
  */
 
 #ifndef ZIGBEE_MODE_ED
@@ -32,15 +27,95 @@
 #endif
 
 #include "Zigbee.h"
+#include "driver/gpio.h"
+#include "esp_sleep.h"
+#include "esp_zigbee_core.h"
 
-/* Zigbee color dimmable light configuration */
+/********************* Configuration **************************/
 #define ZIGBEE_RGB_LIGHT_ENDPOINT 10
-uint8_t led = RGB_BUILTIN;
-uint8_t button = BOOT_PIN;
 
-ZigbeeColorDimmableLight zbColorLight = ZigbeeColorDimmableLight(ZIGBEE_RGB_LIGHT_ENDPOINT);
+// Hardware pins
+const uint8_t LED_PIN = RGB_BUILTIN;
+const uint8_t BUTTON_PIN = BOOT_PIN;
 
-/********************* Temperature conversion functions **************************/
+// Timing configuration
+const unsigned long PAIRING_TIMEOUT_MS = 40000;      // 配网超时时间 (40秒)
+const unsigned long LED_FAST_BLINK_MS = 100;         // 快速闪烁间隔
+const unsigned long LED_SLOW_BLINK_MS = 500;         // 慢速闪烁间隔
+const unsigned long LONG_PRESS_MS = 3000;            // 长按时间 (3秒)
+const unsigned long DEBOUNCE_MS = 100;               // 按键消抖时间
+
+// Default light settings
+const uint8_t DEFAULT_BRIGHTNESS = 255;
+const uint8_t DEFAULT_RED = 255;
+const uint8_t DEFAULT_GREEN = 255;
+const uint8_t DEFAULT_BLUE = 255;
+
+/********************* State Management **************************/
+enum PairingState {
+  PAIRING_IDLE,           // 已配网或等待中
+  PAIRING_IN_PROGRESS,    // 正在配网
+  PAIRING_FAILED          // 配网失败
+};
+
+enum ButtonAction {
+  BUTTON_NONE,
+  BUTTON_SHORT_PRESS,
+  BUTTON_LONG_PRESS
+};
+
+struct DeviceState {
+  PairingState pairing;
+  unsigned long pairingStartTime;
+  unsigned long lastLedToggle;
+  bool ledBlinkOn;
+} state = {
+  .pairing = PAIRING_IDLE,
+  .pairingStartTime = 0,
+  .lastLedToggle = 0,
+  .ledBlinkOn = false
+};
+
+ZigbeeColorDimmableLight zbLight(ZIGBEE_RGB_LIGHT_ENDPOINT);
+
+/********************* LED Control Functions **************************/
+// 统一的LED控制函数
+void ledSetColor(uint8_t r, uint8_t g, uint8_t b) {
+  rgbLedWrite(LED_PIN, r, g, b);
+}
+
+void ledOff() {
+  ledSetColor(0, 0, 0);
+}
+
+void ledBlue() {
+  ledSetColor(0, 0, 255);
+}
+
+void ledRed() {
+  ledSetColor(255, 0, 0);
+}
+
+void ledWhite() {
+  ledSetColor(255, 255, 255);
+}
+
+// 闪烁控制 (非阻塞)
+void ledBlink(unsigned long interval, void (*colorFunc)()) {
+  unsigned long now = millis();
+  if (now - state.lastLedToggle >= interval) {
+    state.ledBlinkOn = !state.ledBlinkOn;
+    if (state.ledBlinkOn) {
+      colorFunc();
+    } else {
+      ledOff();
+    }
+    state.lastLedToggle = now;
+  }
+}
+
+/********************* Light Control Functions **************************/
+// 温度转换
 uint16_t kelvinToMireds(uint16_t kelvin) {
   return 1000000 / kelvin;
 }
@@ -49,120 +124,405 @@ uint16_t miredsToKelvin(uint16_t mireds) {
   return 1000000 / mireds;
 }
 
-/********************* RGB LED functions **************************/
-void setRGBLight(bool state, uint8_t red, uint8_t green, uint8_t blue, uint8_t level) {
-  if (!state) {
-    rgbLedWrite(led, 0, 0, 0);
+// Zigbee RGB模式回调
+void onRgbChange(bool on, uint8_t r, uint8_t g, uint8_t b, uint8_t level) {
+  if (!on) {
+    ledOff();
     return;
   }
-  float brightness = (float)level / 255;
-  rgbLedWrite(led, red * brightness, green * brightness, blue * brightness);
+  float brightness = (float)level / 255.0f;
+  ledSetColor(r * brightness, g * brightness, b * brightness);
 }
 
-/********************* Temperature LED functions **************************/
-void setTempLight(bool state, uint8_t level, uint16_t mireds) {
-  if (!state) {
-    rgbLedWrite(led, 0, 0, 0);
+// Zigbee色温模式回调
+void onTempChange(bool on, uint8_t level, uint16_t mireds) {
+  if (!on) {
+    ledOff();
     return;
   }
-  float brightness = (float)level / 255;
-  // Convert mireds to color temperature (K) and map to white/yellow
+  float brightness = (float)level / 255.0f;
   uint16_t kelvin = miredsToKelvin(mireds);
   uint8_t warm = constrain(map(kelvin, 2000, 6500, 255, 0), 0, 255);
   uint8_t cold = constrain(map(kelvin, 2000, 6500, 0, 255), 0, 255);
-  rgbLedWrite(led, warm * brightness, warm * brightness, cold * brightness);
+  ledSetColor(warm * brightness, warm * brightness, cold * brightness);
 }
 
-// Create a task on identify call to handle the identify function
-void identify(uint16_t time) {
-  static uint8_t blink = 1;
+// Identify回调
+void onIdentify(uint16_t time) {
+  static bool blinkState = true;
   log_d("Identify called for %d seconds", time);
   if (time == 0) {
-    // If identify time is 0, stop blinking and restore light as it was used for identify
-    zbColorLight.restoreLight();
+    zbLight.restoreLight();
     return;
   }
-  rgbLedWrite(led, 255 * blink, 255 * blink, 255 * blink);
-  blink = !blink;
+  blinkState = !blinkState;
+  if (blinkState) {
+    ledWhite();
+  } else {
+    ledOff();
+  }
 }
 
-/********************* Arduino functions **************************/
+/********************* Zigbee Report Functions **************************/
+// 配置On/Off属性报告 (必须在Zigbee.begin()之后调用)
+bool setupOnOffReporting() {
+  esp_zb_zcl_reporting_info_t reporting_info = {};
+  reporting_info.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV;
+  reporting_info.ep = ZIGBEE_RGB_LIGHT_ENDPOINT;
+  reporting_info.cluster_id = ESP_ZB_ZCL_CLUSTER_ID_ON_OFF;
+  reporting_info.cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE;
+  reporting_info.attr_id = ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID;
+  reporting_info.u.send_info.min_interval = 0;
+  reporting_info.u.send_info.max_interval = 300;  // 最大300秒报告一次
+  reporting_info.u.send_info.def_min_interval = 0;
+  reporting_info.u.send_info.def_max_interval = 300;
+  reporting_info.u.send_info.delta.u8 = 1;  // 任何变化都报告
+  reporting_info.dst.profile_id = ESP_ZB_AF_HA_PROFILE_ID;
+  reporting_info.manuf_code = ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC;
+
+  esp_zb_lock_acquire(portMAX_DELAY);
+  esp_err_t ret = esp_zb_zcl_update_reporting_info(&reporting_info);
+  esp_zb_lock_release();
+
+  if (ret != ESP_OK) {
+    Serial.printf("Failed to setup On/Off reporting: 0x%x\n", ret);
+    return false;
+  }
+  Serial.println("On/Off reporting configured");
+  return true;
+}
+
+// 配置Level属性报告
+bool setupLevelReporting() {
+  esp_zb_zcl_reporting_info_t reporting_info = {};
+  reporting_info.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV;
+  reporting_info.ep = ZIGBEE_RGB_LIGHT_ENDPOINT;
+  reporting_info.cluster_id = ESP_ZB_ZCL_CLUSTER_ID_LEVEL_CONTROL;
+  reporting_info.cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE;
+  reporting_info.attr_id = ESP_ZB_ZCL_ATTR_LEVEL_CONTROL_CURRENT_LEVEL_ID;
+  reporting_info.u.send_info.min_interval = 0;
+  reporting_info.u.send_info.max_interval = 300;
+  reporting_info.u.send_info.def_min_interval = 0;
+  reporting_info.u.send_info.def_max_interval = 300;
+  reporting_info.u.send_info.delta.u8 = 1;  // 任何变化都报告
+  reporting_info.dst.profile_id = ESP_ZB_AF_HA_PROFILE_ID;
+  reporting_info.manuf_code = ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC;
+
+  esp_zb_lock_acquire(portMAX_DELAY);
+  esp_err_t ret = esp_zb_zcl_update_reporting_info(&reporting_info);
+  esp_zb_lock_release();
+
+  if (ret != ESP_OK) {
+    Serial.printf("Failed to setup Level reporting: 0x%x\n", ret);
+    return false;
+  }
+  Serial.println("Level reporting configured");
+  return true;
+}
+
+// 配置所有报告
+void setupReporting() {
+  setupOnOffReporting();
+  setupLevelReporting();
+}
+
+// 报告On/Off状态给协调器 (使用显式地址模式)
+bool reportOnOff() {
+  esp_zb_zcl_report_attr_cmd_t cmd = {};
+  // 使用16位短地址模式，直接发送到协调器
+  cmd.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
+  cmd.zcl_basic_cmd.dst_addr_u.addr_short = 0x0000;  // 协调器地址
+  cmd.zcl_basic_cmd.dst_endpoint = 1;  // 协调器endpoint通常是1
+  cmd.zcl_basic_cmd.src_endpoint = ZIGBEE_RGB_LIGHT_ENDPOINT;
+  cmd.clusterID = ESP_ZB_ZCL_CLUSTER_ID_ON_OFF;
+  cmd.attributeID = ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID;
+  cmd.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI;
+  cmd.manuf_code = ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC;
+
+  esp_zb_lock_acquire(portMAX_DELAY);
+  esp_err_t ret = esp_zb_zcl_report_attr_cmd_req(&cmd);
+  esp_zb_lock_release();
+
+  if (ret != ESP_OK) {
+    Serial.printf("Failed to report On/Off: 0x%x\n", ret);
+    return false;
+  }
+  Serial.println("On/Off state reported");
+  return true;
+}
+
+// 报告亮度级别给协调器 (使用显式地址模式)
+bool reportLevel() {
+  esp_zb_zcl_report_attr_cmd_t cmd = {};
+  // 使用16位短地址模式，直接发送到协调器
+  cmd.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
+  cmd.zcl_basic_cmd.dst_addr_u.addr_short = 0x0000;  // 协调器地址
+  cmd.zcl_basic_cmd.dst_endpoint = 1;  // 协调器endpoint通常是1
+  cmd.zcl_basic_cmd.src_endpoint = ZIGBEE_RGB_LIGHT_ENDPOINT;
+  cmd.clusterID = ESP_ZB_ZCL_CLUSTER_ID_LEVEL_CONTROL;
+  cmd.attributeID = ESP_ZB_ZCL_ATTR_LEVEL_CONTROL_CURRENT_LEVEL_ID;
+  cmd.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI;
+  cmd.manuf_code = ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC;
+
+  esp_zb_lock_acquire(portMAX_DELAY);
+  esp_err_t ret = esp_zb_zcl_report_attr_cmd_req(&cmd);
+  esp_zb_lock_release();
+
+  if (ret != ESP_OK) {
+    Serial.printf("Failed to report Level: 0x%x\n", ret);
+    return false;
+  }
+  Serial.println("Level reported");
+  return true;
+}
+
+// 报告所有灯光状态
+void reportLightState() {
+  if (!Zigbee.connected()) {
+    Serial.println("Not connected, skip report");
+    return;
+  }
+  reportOnOff();
+  reportLevel();
+}
+
+// Toggle灯光状态并同步到Zigbee网关
+void toggleLight() {
+  bool currentState = zbLight.getLightState();
+  bool newState = !currentState;
+
+  Serial.printf("Toggle light: %s -> %s\n",
+                currentState ? "ON" : "OFF",
+                newState ? "ON" : "OFF");
+
+  if (newState) {
+    // 开灯: 使用当前颜色和亮度
+    uint8_t level = zbLight.getLightLevel();
+    uint8_t r = zbLight.getLightRed();
+    uint8_t g = zbLight.getLightGreen();
+    uint8_t b = zbLight.getLightBlue();
+
+    // 如果亮度为0，设置默认值
+    if (level == 0) level = DEFAULT_BRIGHTNESS;
+    if (r == 0 && g == 0 && b == 0) {
+      r = DEFAULT_RED;
+      g = DEFAULT_GREEN;
+      b = DEFAULT_BLUE;
+    }
+
+    zbLight.setLight(true, level, r, g, b);
+  } else {
+    // 关灯
+    zbLight.setLightState(false);
+    ledOff();
+  }
+
+  // 报告状态变化给协调器
+  reportLightState();
+}
+
+/********************* Button Handling **************************/
+// 非阻塞式检测按钮动作
+ButtonAction checkButton() {
+  static bool wasPressed = false;
+  static unsigned long pressStartTime = 0;
+  static bool longPressHandled = false;
+
+  bool isPressed = (digitalRead(BUTTON_PIN) == LOW);
+
+  if (isPressed && !wasPressed) {
+    // 按下瞬间
+    pressStartTime = millis();
+    longPressHandled = false;
+    wasPressed = true;
+  } else if (isPressed && wasPressed) {
+    // 持续按住
+    if (!longPressHandled && (millis() - pressStartTime > LONG_PRESS_MS)) {
+      longPressHandled = true;
+      return BUTTON_LONG_PRESS;
+    }
+  } else if (!isPressed && wasPressed) {
+    // 释放按钮
+    wasPressed = false;
+    if (!longPressHandled && (millis() - pressStartTime > DEBOUNCE_MS)) {
+      return BUTTON_SHORT_PRESS;
+    }
+  }
+
+  return BUTTON_NONE;
+}
+
+// 处理按钮动作
+void handleButton(ButtonAction action) {
+  switch (action) {
+    case BUTTON_SHORT_PRESS:
+      Serial.println("Short press: Toggle light");
+      toggleLight();
+      break;
+
+    case BUTTON_LONG_PRESS:
+      Serial.println("Long press: Factory reset");
+      ledRed();
+      delay(500);
+      Zigbee.factoryReset();
+      break;
+
+    default:
+      break;
+  }
+}
+
+/********************* Pairing State Machine **************************/
+void updatePairingState() {
+  bool connected = Zigbee.connected();
+  unsigned long elapsed = millis() - state.pairingStartTime;
+
+  switch (state.pairing) {
+    case PAIRING_IDLE:
+      if (!connected) {
+        // 开始配网
+        state.pairing = PAIRING_IN_PROGRESS;
+        state.pairingStartTime = millis();
+        Serial.println("Starting pairing...");
+      }
+      break;
+
+    case PAIRING_IN_PROGRESS:
+      if (connected) {
+        // 配网成功
+        state.pairing = PAIRING_IDLE;
+        Serial.println("Pairing successful!");
+
+        // 配置属性报告 (必须在连接后调用)
+        setupReporting();
+
+        zbLight.restoreLight();
+        // 延迟一点时间后报告初始状态
+        delay(500);
+        reportLightState();
+      } else if (elapsed > PAIRING_TIMEOUT_MS) {
+        // 配网超时
+        state.pairing = PAIRING_FAILED;
+        Serial.println("Pairing timeout!");
+      } else {
+        // 配网中: 蓝色慢闪
+        ledBlink(LED_SLOW_BLINK_MS, ledBlue);
+
+        // 每秒打印进度
+        static unsigned long lastPrint = 0;
+        if (millis() - lastPrint > 1000) {
+          Serial.printf("Pairing... %lus / %lus\n", elapsed / 1000, PAIRING_TIMEOUT_MS / 1000);
+          lastPrint = millis();
+        }
+      }
+      break;
+
+    case PAIRING_FAILED:
+      // 显示红灯2秒后进入睡眠
+      ledRed();
+      delay(2000);
+      enterDeepSleep();
+      break;
+  }
+}
+
+/********************* Deep Sleep **************************/
+void enterDeepSleep() {
+  Serial.println("Entering deep sleep...");
+  Serial.println("Long press button (3s) to wake and re-pair.");
+
+  ledOff();
+  delay(100);
+
+  // 配置GPIO唤醒
+  gpio_wakeup_enable((gpio_num_t)BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+
+  Serial.flush();
+  esp_deep_sleep_start();
+}
+
+// 处理从深度睡眠唤醒
+bool handleWakeup() {
+  esp_sleep_wakeup_cause_t reason = esp_sleep_get_wakeup_cause();
+
+  if (reason == ESP_SLEEP_WAKEUP_GPIO) {
+    Serial.println("Woke up from deep sleep!");
+
+    // 检查是否长按
+    unsigned long pressStart = millis();
+    while (digitalRead(BUTTON_PIN) == LOW) {
+      delay(50);
+      if (millis() - pressStart > LONG_PRESS_MS) {
+        Serial.println("Long press detected, starting pairing...");
+        return true;  // 继续启动
+      }
+    }
+
+    // 短按，回到睡眠
+    Serial.println("Short press, going back to sleep...");
+    enterDeepSleep();
+  }
+
+  return true;  // 正常启动
+}
+
+/********************* Arduino Entry Points **************************/
 void setup() {
   Serial.begin(115200);
 
-  // Init RMT and leave light OFF
-  rgbLedWrite(led, 0, 0, 0);
+  // 初始化硬件
+  ledOff();
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
 
-  // Init button for factory reset
-  pinMode(button, INPUT_PULLUP);
+  // 处理唤醒
+  if (!handleWakeup()) {
+    return;  // 不会执行到这里
+  }
 
-  // Enable both XY (RGB) and Temperature color capabilities
+  // 配置Zigbee灯
   uint16_t capabilities = ZIGBEE_COLOR_CAPABILITY_X_Y | ZIGBEE_COLOR_CAPABILITY_COLOR_TEMP;
-  zbColorLight.setLightColorCapabilities(capabilities);
+  zbLight.setLightColorCapabilities(capabilities);
+  zbLight.onLightChangeRgb(onRgbChange);
+  zbLight.onLightChangeTemp(onTempChange);
+  zbLight.onIdentify(onIdentify);
+  zbLight.setManufacturerAndModel("Espressif", "ZBColorLightBulb");
+  zbLight.setLightColorTemperatureRange(kelvinToMireds(6500), kelvinToMireds(2000));
 
-  // Set callback functions for RGB and Temperature modes
-  zbColorLight.onLightChangeRgb(setRGBLight);
-  zbColorLight.onLightChangeTemp(setTempLight);
+  // 启动Zigbee
+  Serial.println("Starting Zigbee...");
+  Zigbee.addEndpoint(&zbLight);
 
-  // Optional: Set callback function for device identify
-  zbColorLight.onIdentify(identify);
-
-  // Optional: Set Zigbee device name and model
-  zbColorLight.setManufacturerAndModel("Espressif", "ZBColorLightBulb");
-
-  // Set min/max temperature range (High Kelvin -> Low Mireds: Min and Max is switched)
-  zbColorLight.setLightColorTemperatureRange(kelvinToMireds(6500), kelvinToMireds(2000));
-
-  // Add endpoint to Zigbee Core
-  Serial.println("Adding ZigbeeLight endpoint to Zigbee Core");
-  Zigbee.addEndpoint(&zbColorLight);
-
-  // When all EPs are registered, start Zigbee in End Device mode
   if (!Zigbee.begin()) {
-    Serial.println("Zigbee failed to start!");
-    Serial.println("Rebooting...");
+    Serial.println("Zigbee failed! Rebooting...");
     ESP.restart();
   }
-  
-  Serial.println("Zigbee started.");
-  Serial.println("Entering main loop (Connecting to network in background)...");
-  
-  // 【关键修改】：移除了这里的 while (!Zigbee.connected()) 阻塞循环
-  // 让程序直接进入 loop()，这样按键检测才能立刻生效
+
+  Serial.println("Zigbee started, entering main loop...");
+
+  // 初始化状态
+  state.pairingStartTime = millis();
+  if (Zigbee.connected()) {
+    state.pairing = PAIRING_IDLE;
+    // 已配网，配置报告并同步初始状态
+    setupReporting();
+    delay(500);
+    reportLightState();
+  } else {
+    state.pairing = PAIRING_IN_PROGRESS;
+  }
 }
 
 void loop() {
-  
-  // 1. 处理按键逻辑 (最优先)
-  // Checking button for factory reset
-  if (digitalRead(button) == LOW) {  // Push button pressed
-    // Key debounce handling
-    delay(100);
-    int startTime = millis();
-    while (digitalRead(button) == LOW) {
-      delay(50);
-      if ((millis() - startTime) > 3000) {
-        // If key pressed for more than 3secs, factory reset Zigbee and reboot
-        Serial.println("Resetting Zigbee to factory and rebooting in 1s.");
-        delay(1000);
-        Zigbee.factoryReset();
-      }
-    }
-    // Increase blightness by 50 every time the button is pressed (Short press)
-    zbColorLight.setLightLevel(zbColorLight.getLightLevel() + 50);
+  // 1. 处理按钮
+  ButtonAction action = checkButton();
+  if (action != BUTTON_NONE) {
+    handleButton(action);
   }
 
-  // 2. 处理连接状态打印 (非阻塞)
-  // 使用静态变量记录时间，每隔1秒打印一次连接状态，而不是卡死程序
-  static unsigned long last_print_time = 0;
-  if (!Zigbee.connected()) {
-    if (millis() - last_print_time > 1000) {
-        Serial.print(".");
-        last_print_time = millis();
-    }
-  }
+  // 2. 处理配网状态
+  updatePairingState();
 
-  // 3. Zigbee 内部任务处理
-  // Arduino Zigbee 库通常会在后台处理 Zigbee 栈，这里只需要简单的 delay
-  delay(100); 
+  // 3. 短延迟
+  delay(10);
 }
